@@ -66,7 +66,10 @@ def main():
 
     cuts = load_manifest(args.manifest_in)
     cuts = cuts.cut_into_windows(duration=args.chunk)
-    cuts = cuts.extend_by(args.extra, direction="both", pad_silence=False)
+    if args.extra == 0:
+        cuts = cuts.map(lambda c: c.extend_by(duration=1.0, direction="both", pad_silence=False) if c.duration < 1 else c)
+    else:
+        cuts = cuts.extend_by(args.extra, direction="both", pad_silence=False)
     # Remove existing supervisions and add empty ones.
     cuts = cuts.drop_supervisions()
     cuts = cuts.fill_supervisions()

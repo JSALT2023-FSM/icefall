@@ -238,6 +238,9 @@ def merge_chunks(
         # hyp_word_alignments = words_post_processing(hyp_word_alignments)
         hyp_text = " ".join(ali.symbol for ali in hyp_word_alignments)
 
+        # Needed for gigaspeech
+        hyp_text = hyp_text.lower()
+
         new_sup = SupervisionSegment(
             id=rec.id,
             recording_id=rec.id,
