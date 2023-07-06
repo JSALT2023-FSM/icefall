@@ -42,6 +42,9 @@ from torch.utils.data import DataLoader
 
 from icefall.utils import str2bool
 
+# I am an elite hacker
+TedLiumAsrDataModule = None
+LibriSpeechAsrDataModule = None
 
 class SpeechRecognitionDataset(K2SpeechRecognitionDataset):
     def __init__(
