@@ -58,7 +58,7 @@ from beam_search import (
     greedy_search_batch,
     modified_beam_search,
 )
-from train import add_model_arguments, get_params, get_model
+from train import add_model_arguments, get_params, get_transducer_model
 
 from icefall.checkpoint import average_checkpoints, find_checkpoints, load_checkpoint
 from icefall.utils import (
@@ -111,6 +111,11 @@ def get_parser():
         type=str,
         default="zipformer/exp",
         help="The experiment dir",
+    )
+    parser.add_argument(
+        "--res-dir",
+        type=str,
+        help="The results/output dir",
     )
 
     parser.add_argument(
@@ -416,6 +421,8 @@ def main():
     Earnings21AsrDataModule.add_arguments(parser)
     args = parser.parse_args()
     args.exp_dir = Path(args.exp_dir)
+    args.res_dir = Path(args.res_dir)
+    args.res_dir.mkdir(exists_ok=True)
 
     params = get_params()
     params.update(vars(args))
@@ -427,7 +434,9 @@ def main():
         "fast_beam_search_nbest",
         "modified_beam_search",
     )
-    params.res_dir = params.exp_dir / f"{params.decoding_method}-chunked"
+
+    if not params.res_dir:
+        params.res_dir = params.exp_dir / f"{params.decoding_method}-chunked"
 
     if params.iter > 0:
         params.suffix = f"iter-{params.iter}-avg-{params.avg}"
@@ -464,7 +473,7 @@ def main():
     logging.info(params)
 
     logging.info("About to create model")
-    model = get_model(params)
+    model = get_transducer_model(params)
 
     if params.iter > 0:
         filenames = find_checkpoints(params.exp_dir, iteration=-params.iter)[
