@@ -31,16 +31,16 @@ torch.set_num_interop_threads(1)
 torch.multiprocessing.set_sharing_strategy("file_system")
 
 
-def compute_fbank_gigaspeech_dev_test():
+def compute_fbank_gigaspeech_train():
     manifest_dir = Path("data/manifests")
     feats_dir = Path("data/fbank")
     # number of workers in dataloader
-    num_workers = 20
+    num_workers = 5
 
     # number of seconds in a batch
     batch_duration = 600
 
-    subsets = ("DEV", "TEST")
+    subsets = ("M")
 
     device = torch.device("cpu")
     if torch.cuda.is_available():
@@ -56,7 +56,7 @@ def compute_fbank_gigaspeech_dev_test():
             logging.info(f"{cuts_path} exists - skipping")
             continue
 
-        raw_cuts_path = manifest_dir / f"cuts_{partition}_raw.jsonl.gz"
+        raw_cuts_path = manifest_dir / f"gigaspeech_cuts_{partition}.jsonl.gz"
 
         logging.info(f"Loading {raw_cuts_path}")
         cut_set = CutSet.from_file(raw_cuts_path)
@@ -77,14 +77,13 @@ def compute_fbank_gigaspeech_dev_test():
 
         logging.info(f"Saving to {cuts_path}")
         cut_set.to_file(cuts_path)
-        logging.info(f"Saved to {cuts_path}")
 
 
 def main():
     formatter = "%(asctime)s %(levelname)s [%(filename)s:%(lineno)d] %(message)s"
     logging.basicConfig(format=formatter, level=logging.INFO)
 
-    compute_fbank_gigaspeech_dev_test()
+    compute_fbank_gigaspeech_train()
 
 
 if __name__ == "__main__":
