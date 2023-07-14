@@ -84,6 +84,12 @@ def get_parser():
         help="""Extra duration (in seconds) at both sides.""",
     )
 
+    parser.add_argument(
+        "--trim-to-gold-segments",
+        action="store_true",
+        help="""Whether to trim hyp to gold segments.""",
+    )
+
     return parser.parse_args()
 
 
@@ -174,6 +180,100 @@ def words_post_processing(text: List[AlignmentItem]) -> List[AlignmentItem]:
                 )
             )
     return res
+
+
+def merge_chunks_and_resegment(
+    cuts_chunk: CutSet,
+    cuts_orig: CutSet,
+    sp: spm.SentencePieceProcessor,
+    extra: float,
+) -> CutSet:
+    """Merge chunk-wise cuts and group into original segmentation.
+    DELETES WORDS THAT ARE NOT IN BOUNDS OF ORIGINAL SEGMENTS.
+
+    Args:
+      cuts_chunk:
+        The chunk-wise cuts.
+      cuts_orig:
+        The original segments.
+      sp:
+        The BPE model.
+      extra:
+        Extra duration (in seconds) to drop at both sides of each chunk.
+    """
+    # Divide into groups according to their recording ids
+    cut_groups = groupby(
+        lambda cut: cut.recording.id, sorted(cuts_chunk, key=lambda c: c.recording_id)
+    )
+
+    # Get original cuts by recording ids
+    orig_cuts = {c.recording.id: c for c in cuts_orig}
+
+    utt_cut_list = []
+    for recording_id, cuts in cut_groups.items():
+        # For each group with a same recording, sort it accroding to the start time
+        chunk_cuts = sorted(cuts, key=(lambda cut: cut.start))
+
+        rec = chunk_cuts[0].recording
+        alignments = []
+        for cut in chunk_cuts:
+            # Get left and right borders
+            left = cut.start + extra if cut.start > 0 else 0
+            right = cut.end - extra if cut.end < rec.duration else rec.duration
+
+            assert len(cut.supervisions) == 1, len(cut.supervisions)
+            alis = cut.supervisions[0].alignment["symbol"]
+            for i, ali in enumerate(sorted(alis, key=lambda a: a.start)):
+                t = ali.start + cut.start
+                if left <= t < right:
+                    # We assume that a BPE token can be at most 0.2 seconds long.
+                    duration = (
+                        min(0.2, round(alis[i + 1].start - ali.start, 2))
+                        if i < len(alis) - 1
+                        else 0.2
+                    )
+                    alignments.append(
+                        AlignmentItem(start=t, duration=duration, symbol=ali.symbol)
+                    )
+        # Get word level alignments early to align with gold segments
+        hyp_word_alignments = get_word_alignments(alignments)
+        hyp_word_alignments = words_post_processing(hyp_word_alignments)
+
+        orig_cut = orig_cuts[recording_id]
+        for old_sup in orig_cut.supervisions:
+            old_text = asr_text_post_processing(old_sup.text)
+
+            segmented_ali = []
+            for ali in hyp_word_alignments:
+                mid = ali.start + (ali.duration / 2)
+                if old_sup.start <= mid and old_sup.end >= mid:
+                    segmented_ali.append(ali)
+
+            hyp_text = " ".join(ali.symbol for ali in segmented_ali)
+
+            new_sup = SupervisionSegment(
+                id=old_sup.id,
+                recording_id=rec.id,
+                start=0,
+                duration=old_sup.duration,
+                text=hyp_text,
+                alignment={"word": segmented_ali},
+                language=old_sup.language,
+                speaker=old_sup.speaker,
+                custom={"orig_text": old_text},
+            )
+
+            utt_cut = MonoCut(
+                id=old_sup.id,
+                start=0,
+                duration=old_sup.duration,
+                channel=0,
+                recording=rec,
+                supervisions=[new_sup],
+            )
+            utt_cut_list.append(utt_cut)
+
+    return CutSet.from_cuts(utt_cut_list)
 
 
 def merge_chunks(
@@ -351,7 +451,12 @@ def main():
     stm_file = scoring_dir / f"ref.stm"
     ctm_file = scoring_dir / f"hyp.ctm"
 
-    merged_cuts = merge_chunks(
+    if args.trim_to_gold_segments:
+        merge_fn = merge_chunks_and_resegment
+    else:
+        merge_fn = merge_chunks
+
+    merged_cuts = merge_fn(
         recog_cuts,
         orig_cuts,
         sp=sp,
