@@ -23,19 +23,21 @@ with NIST asclite.
 """
 
 import argparse
+import kaldialign
 import logging
+from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Tuple
 from cytoolz.itertoolz import groupby
 
+import numpy as np
 import sentencepiece as spm
 from icefall.utils import store_transcripts, write_error_stats
-from lhotse import CutSet, load_manifest
+from lhotse import CutSet, load_manifest, SupervisionSegment, MonoCut
 from lhotse.supervision import AlignmentItem
-from lhotse import SupervisionSegment, MonoCut
+from lhotse.utils import fastcopy
 
 from gigaspeech_scoring import asr_text_post_processing
-
 
 def get_parser():
     parser = argparse.ArgumentParser()
@@ -62,33 +64,42 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--reference-ctm-dir",
+        type=Path,
+        default=None,
+        help="Path to directory containing reference CTM files.",
+    )
+
+    parser.add_argument(
         "--chunk",
-        type=float,
+        type=int,
         default=30.0,
         help="""Chunk duration (in seconds) for decoding.""",
     )
 
     parser.add_argument(
         "--extra",
-        type=float,
+        type=int,
         default=2.0,
         help="""Extra duration (in seconds) at both sides.""",
+    )
+
+    parser.add_argument(
+        "--trim-to-gold-segments",
+        action="store_true",
+        help="""Whether to trim hyp to gold segments.""",
     )
 
     return parser.parse_args()
 
 
-def get_word_alignments(
-    tokens: List[AlignmentItem], words: List[str]
-) -> List[AlignmentItem]:
+def get_word_alignments(tokens: List[AlignmentItem]) -> List[AlignmentItem]:
     """
     Get word-level alignments from token-level alignments.
 
     Args:
       tokens:
         List of token-level alignments.
-      words:
-        List of words (obtained by decoding the BPE tokens).
 
     Returns:
       List of word-level alignments.
@@ -96,21 +107,24 @@ def get_word_alignments(
     start_token = b"\xe2\x96\x81".decode()  # '_'
     onset = None
     offset = None
-    flag = False  # flag to indicate whether next word is the start of a word
+    word = ""
+    flag = True  # flag to indicate whether next word is the start of a word
     res = []
 
     # First compute the onset and offset of each word. The logic is as follows:
-    # 1. If a token starts with `_`, it means it is the start of a new word.
-    # 2. If a token does not start with `_`, it means it may be start of a new word
-    #    or continuation of a word. It is start of new word if previous token is `_`.
+    # 1. If the token is `_`, it means the next token is the start of a word.
+    # 2. If a token starts with `_`, it means it is the start of a new word.
+    # 3. Otherwise, it is the continuation of a word.
+    tokens = sorted(tokens, key=lambda x: x.start)
     for i in range(len(tokens)):
         if tokens[i].symbol.startswith(start_token):
             # This means current word has ended. We will add it to the list.
             if onset is not None and offset is not None:
-                res.append((onset, offset))
+                res.append((onset, offset, word))
                 # reset onset and offset
                 onset = None
                 offset = None
+                word = ""
 
             if len(tokens[i].symbol) == 1:
                 # This is the `_` token. So next token is the start of a word. We turn on the flag.
@@ -119,25 +133,23 @@ def get_word_alignments(
                 # This is the start of a word
                 onset = tokens[i].start
                 offset = tokens[i].end
+                word = tokens[i].symbol[1:]
                 flag = False
         else:
             if flag is True:
                 # This is the first token of a word
                 onset = tokens[i].start
                 offset = tokens[i].end
+                word = tokens[i].symbol
                 flag = False
             else:
                 # This is continuation of a word
                 assert onset is not None and offset is not None
                 offset = tokens[i].end
+                word += tokens[i].symbol
     # Add the last word
     if onset is not None and offset is not None:
-        res.append((onset, offset))
-    if len(words) > len(res):
-        words = words[: len(res)]
-    if len(res) > len(words):
-        res = res[: len(words)]
-    assert len(res) == len(words), (len(res), len(words))
+        res.append((onset, offset, word))
 
     # Then we create word-level alignments
     word_alignments = []
@@ -146,7 +158,7 @@ def get_word_alignments(
             AlignmentItem(
                 start=res[i][0],
                 duration=res[i][1] - res[i][0],
-                symbol=words[i],
+                symbol=res[i][2],
             )
         )
     return word_alignments
@@ -170,6 +182,100 @@ def words_post_processing(text: List[AlignmentItem]) -> List[AlignmentItem]:
     return res
 
 
+def merge_chunks_and_resegment(
+    cuts_chunk: CutSet,
+    cuts_orig: CutSet,
+    sp: spm.SentencePieceProcessor,
+    extra: float,
+) -> CutSet:
+    """Merge chunk-wise cuts and group into original segmentation.
+    DELETES WORDS THAT ARE NOT IN BOUNDS OF ORIGINAL SEGMENTS.
+
+    Args:
+      cuts_chunk:
+        The chunk-wise cuts.
+      cuts_orig:
+        The original segments.
+      sp:
+        The BPE model.
+      extra:
+        Extra duration (in seconds) to drop at both sides of each chunk.
+    """
+    # Divide into groups according to their recording ids
+    cut_groups = groupby(
+        lambda cut: cut.recording.id, sorted(cuts_chunk, key=lambda c: c.recording_id)
+    )
+
+    # Get original cuts by recording ids
+    orig_cuts = {c.recording.id: c for c in cuts_orig}
+
+    utt_cut_list = []
+    for recording_id, cuts in cut_groups.items():
+        # For each group with a same recording, sort it accroding to the start time
+        chunk_cuts = sorted(cuts, key=(lambda cut: cut.start))
+
+        rec = chunk_cuts[0].recording
+        alignments = []
+        for cut in chunk_cuts:
+            # Get left and right borders
+            left = cut.start + extra if cut.start > 0 else 0
+            right = cut.end - extra if cut.end < rec.duration else rec.duration
+
+            assert len(cut.supervisions) == 1, len(cut.supervisions)
+            alis = cut.supervisions[0].alignment["symbol"]
+            for i, ali in enumerate(sorted(alis, key=lambda a: a.start)):
+                t = ali.start + cut.start
+                if left <= t < right:
+                    # We assume that a BPE token can be at most 0.2 seconds long.
+                    duration = (
+                        min(0.2, round(alis[i + 1].start - ali.start, 2))
+                        if i < len(alis) - 1
+                        else 0.2
+                    )
+                    alignments.append(
+                        AlignmentItem(start=t, duration=duration, symbol=ali.symbol)
+                    )
+        # Get word level alignments early to align with gold segments
+        hyp_word_alignments = get_word_alignments(alignments)
+        hyp_word_alignments = words_post_processing(hyp_word_alignments)
+
+        orig_cut = orig_cuts[recording_id]
+        for old_sup in orig_cut.supervisions:
+            old_text = asr_text_post_processing(old_sup.text)
+
+            segmented_ali = []
+            for ali in hyp_word_alignments:
+                mid = ali.start + (ali.duration / 2)
+                if old_sup.start <= mid and old_sup.end >= mid:
+                    segmented_ali.append(ali)
+
+            hyp_text = " ".join(ali.symbol for ali in segmented_ali)
+
+            new_sup = SupervisionSegment(
+                id=old_sup.id,
+                recording_id=rec.id,
+                start=0,
+                duration=old_sup.duration,
+                text=hyp_text,
+                alignment={"word": segmented_ali},
+                language=old_sup.language,
+                speaker=old_sup.speaker,
+                custom={"orig_text": old_text},
+            )
+
+            utt_cut = MonoCut(
+                id=old_sup.id,
+                start=0,
+                duration=old_sup.duration,
+                channel=0,
+                recording=rec,
+                supervisions=[new_sup],
+            )
+            utt_cut_list.append(utt_cut)
+
+    return CutSet.from_cuts(utt_cut_list)
+
+
 def merge_chunks(
     cuts_chunk: CutSet,
     cuts_orig: CutSet,
@@ -186,7 +292,9 @@ def merge_chunks(
         Extra duration (in seconds) to drop at both sides of each chunk.
     """
     # Divide into groups according to their recording ids
-    cut_groups = groupby(lambda cut: cut.recording.id, cuts_chunk)
+    cut_groups = groupby(
+        lambda cut: cut.recording.id, sorted(cuts_chunk, key=lambda c: c.recording_id)
+    )
 
     # Get original cuts by recording ids
     orig_cuts = {c.recording.id: c for c in cuts_orig}
@@ -203,27 +311,22 @@ def merge_chunks(
 
         rec = chunk_cuts[0].recording
         alignments = []
-        cur_end = 0
         for cut in chunk_cuts:
             # Get left and right borders
             left = cut.start + extra if cut.start > 0 else 0
-            chunk_end = cut.start + cut.duration
-            right = chunk_end - extra if chunk_end < rec.duration else rec.duration
-
-            # Assert the chunks are continuous
-            assert left == cur_end, (left, cur_end)
-            cur_end = right
+            right = cut.end - extra if cut.end < rec.duration else rec.duration
 
             assert len(cut.supervisions) == 1, len(cut.supervisions)
             alis = cut.supervisions[0].alignment["symbol"]
-            for i, ali in enumerate(alis):
+            for i, ali in enumerate(sorted(alis, key=lambda a: a.start)):
                 t = ali.start + cut.start
-                duration = (
-                    min(0.2, round(alis[i + 1].start - ali.start, 2))
-                    if i < len(alis) - 1
-                    else 0.2
-                )
                 if left <= t < right:
+                    # We assume that a BPE token can be at most 0.2 seconds long.
+                    duration = (
+                        min(0.2, round(alis[i + 1].start - ali.start, 2))
+                        if i < len(alis) - 1
+                        else 0.2
+                    )
                     alignments.append(
                         AlignmentItem(start=t, duration=duration, symbol=ali.symbol)
                     )
@@ -234,7 +337,7 @@ def merge_chunks(
 
         # We also want to compute word level alignments so we can get CTM file
         # for scoring with NIST asclite.
-        hyp_word_alignments = get_word_alignments(alignments, hyp_text.split(" "))
+        hyp_word_alignments = get_word_alignments(alignments)
         hyp_word_alignments = words_post_processing(hyp_word_alignments)
         hyp_text = " ".join(ali.symbol for ali in hyp_word_alignments)
 
@@ -285,13 +388,50 @@ def save_results(
     # ref/hyp pairs.
     errs_filename = res_dir / f"errs-{test_set_name}.txt"
     with open(errs_filename, "w") as f:
-        wer = write_error_stats(f, f"{test_set_name}", results, enable_log=True)
+        wer = write_error_stats(
+            f, f"{test_set_name}", results, enable_log=True#, sclite_mode=True
+        )
 
     logging.info("Wrote detailed error stats to {}".format(errs_filename))
 
     errs_info = res_dir / f"wer-summary-{test_set_name}.txt"
     with open(errs_info, "w") as f:
-        print("WER: {:.2f}".format(wer * 100), file=f)
+        print("WER: {:.2f}".format(wer), file=f)
+
+
+def read_words_from_ctm(file):
+    words = defaultdict(list)
+    with open(file, "r") as f:
+        for line in f:
+            reco_id, channel, start, dur, word, *_ = line.strip().split()
+            start = float(start)
+            end = round(start + float(dur), 2)
+            words[reco_id].append((start, end, word))
+    return words
+
+
+def align(a, b):
+    """
+    Here a and b are tuples of (start, end, word).
+    """
+    ax = [x[2] for x in a]
+    bx = [x[2] for x in b]
+    ali = kaldialign.align(ax, bx, "*", sclite_mode=True)
+
+    i = 0
+    j = 0
+    ali_times = []
+    for (ai, bj) in ali:
+        if ai == bj:
+            a_mean = (a[i][0] + a[i][1]) / 2
+            b_mean = (b[j][0] + b[j][1]) / 2
+            delay = round(b_mean - a_mean, 3)
+            ali_times.append((a[i], b[j], delay))
+        if ai != "*":
+            i += 1
+        if bj != "*":
+            j += 1
+    return ali_times
 
 
 def main():
@@ -300,51 +440,80 @@ def main():
     sp = spm.SentencePieceProcessor()
     sp.load(args.bpe_model)
 
-    for part in ["DEV"]:
-        logging.info(f"Scoring {part}...")
-        name = f"{part}_chunk{int(args.chunk)}_extra{int(args.extra)}"
-        scoring_dir = args.res_dir / f"{name}_scoring"
-        scoring_dir.mkdir(exist_ok=True)
+    logging.info(f"Scoring...")
+    scoring_dir = args.res_dir / f"_scoring"
+    scoring_dir.mkdir(exist_ok=True)
 
-        recog_cuts = load_manifest(args.res_dir / f"cuts_{name}.jsonl.gz")
-        orig_cuts = load_manifest(args.manifest_dir / f"cuts_{part}_full.jsonl.gz")
-        out_file = args.res_dir / f"cuts_{name}_merged.jsonl.gz"
-        stm_file = scoring_dir / f"ref.stm"
-        ctm_file = scoring_dir / f"hyp.ctm"
+    recog_cuts = load_manifest(args.res_dir / f"cuts_TEST_chunk{args.chunk}_extra{args.extra}.jsonl.gz")
+    orig_cuts = load_manifest(args.manifest_dir / f"cuts_TEST_full.jsonl.gz")
+    out_file = args.res_dir / f"cuts_test_merged.jsonl.gz"
+    #ref_ctm_file = args.reference_ctm_dir / f"test.ctm"
+    stm_file = scoring_dir / f"ref.stm"
+    ctm_file = scoring_dir / f"hyp.ctm"
 
-        merged_cuts = merge_chunks(
-            recog_cuts,
-            orig_cuts,
-            sp=sp,
-            extra=args.extra,
-        )
-        merged_cuts.to_file(out_file)
-        logging.info(f"Cuts saved to {out_file}")
+    if args.trim_to_gold_segments:
+        merge_fn = merge_chunks_and_resegment
+    else:
+        merge_fn = merge_chunks
 
-        # Write CTM file
-        out_sups = merged_cuts.decompose()[1]
-        out_sups.write_alignment_to_ctm(ctm_file, type="word")
+    merged_cuts = merge_fn(
+        recog_cuts,
+        orig_cuts,
+        sp=sp,
+        extra=args.extra,
+    )
+    merged_cuts.to_file(out_file)
+    logging.info(f"Cuts saved to {out_file}")
 
-        # Write STM file. Gigaspeech does not have speaker labels, so we assign different
-        # speaker labels to each supervision.
-        with open(stm_file, "w") as f:
-            for cut in orig_cuts:
-                for idx, sup in enumerate(cut.supervisions):
-                    text = asr_text_post_processing(sup.text)
-                    print(
-                        f"{sup.recording_id} {sup.channel} {sup.speaker} {sup.start:.2f} {sup.end:.2f} {text}",
-                        file=f,
+    # Write CTM file
+    out_sups = merged_cuts.decompose()[1]
+    out_sups.write_alignment_to_ctm(ctm_file, type="word")
+
+    # Write STM file. Some cuts have overlapping segments from the same speaker,
+    # which is not allowed in STM file. We will merge these supervisions.
+    with open(stm_file, "w") as f:
+        for cut in orig_cuts:
+            new_sups = []
+            for sup in sorted(cut.supervisions, key=lambda x: x.start):
+                if new_sups and new_sups[-1].end >= sup.start:
+                    old_sup = new_sups[-1]
+                    new_sups[-1] = fastcopy(
+                        old_sup,
+                        duration=sup.end - old_sup.start,
+                        text=old_sup.text + " " + sup.text,
                     )
+                else:
+                    new_sups.append(sup)
+            for sup in new_sups:
+                text = asr_text_post_processing(sup.text)
+                print(
+                    f"{sup.recording_id} {sup.channel} {sup.speaker} {sup.start:.2f} {sup.end:.2f} {text}",
+                    file=f,
+                )
 
-        results = []
-        for cut in merged_cuts:
-            ref = cut.supervisions[0].custom["orig_text"]
-            hyp = cut.supervisions[0].text
-            # convert ref and hyp to list of words
-            ref = ref.split()
-            hyp = hyp.split()
-            results.append((cut.id, ref, hyp))
-        save_results(args.res_dir, part, results)
+    results = []
+    for cut in merged_cuts:
+        ref = cut.supervisions[0].custom["orig_text"]
+        hyp = cut.supervisions[0].text
+        # convert ref and hyp to list of words
+        ref = ref.split()
+        hyp = hyp.split()
+        results.append((cut.id, ref, hyp))
+    save_results(args.res_dir, "test", results)
+
+    # Compute word emission delay
+    #ref_words = read_words_from_ctm(ref_ctm_file)
+    #hyp_words = read_words_from_ctm(ctm_file)
+
+    #delays = []
+    #for reco_id in ref_words:
+    #    res = align(ref_words[reco_id], hyp_words[reco_id])
+    #    delays.extend([r[2] for r in res])
+
+    # compute mean and std
+    #mean = np.mean(delays)
+    #std = np.std(delays)
+    #print(f"Mean delay: {mean:.3f}, std: {std:.3f}")
 
 
 if __name__ == "__main__":
@@ -352,3 +521,4 @@ if __name__ == "__main__":
     logging.basicConfig(format=formatter, level=logging.INFO)
 
     main()
+

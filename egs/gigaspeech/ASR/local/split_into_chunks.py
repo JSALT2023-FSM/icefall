@@ -63,7 +63,7 @@ def main():
     manifest_dir = Path(args.manifest_dir)
     manifest_dir.mkdir(parents=True, exist_ok=True)
 
-    subsets = ["DEV"]
+    subsets = ["DEV", "TEST"]
 
     for subset in subsets:
         logging.info(f"Processing {subset} subset")
@@ -79,9 +79,11 @@ def main():
         manifest_in = args.manifest_dir / f"cuts_{subset}_full.jsonl.gz"
 
         cuts = load_manifest(manifest_in)
-        cuts = cuts.cut_into_windows(
-            duration=args.chunk, hop=args.chunk - args.extra * 2
-        )
+        cuts = cuts.cut_into_windows(duration=args.chunk)
+        if args.extra == 0:
+            cuts = cuts.map(lambda c: c.extend_by(duration=1.0, direction="both", pad_silence=False) if c.duration < 1 else c)
+        else:
+            cuts = cuts.extend_by(args.extra, direction="both", pad_silence=False)
         # Remove existing supervisions and add empty ones.
         cuts = cuts.drop_supervisions()
         cuts = cuts.fill_supervisions()
